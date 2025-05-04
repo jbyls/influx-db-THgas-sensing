@@ -1,73 +1,42 @@
-#!/usr/bin/env python3
-"""
-SCD30 Sensor Data Collector for InfluxDB Cloud
-
-This script reads CO2, temperature, and humidity data from an SCD30 sensor
-connected to a Feather S2 board via I2C, and stores the data in InfluxDB Cloud.
-"""
-
 import os
 import time
+import json
 import logging
 import serial
-import json
-import sys
-import requests
+import re
 from datetime import datetime
+import requests
+import backoff
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
-from influxdb_client.rest import ApiException
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("sensor_data.log"),
-        logging.StreamHandler()
+        logging.StreamHandler(),
+        logging.FileHandler('sensor_data.log')
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Helper function to safely get and convert environment variables
 def get_env_var(var_name, default=None, var_type=str):
-    value = os.getenv(var_name, default)
+    """Get environment variable with optional default value and type conversion."""
+    value = os.getenv(var_name)
     if value is None:
-        return None
-    
-    # For debugging
-    print(f"Raw {var_name}: '{value}'")
-    
-    try:
-        if var_type is int:
-            # Strip any whitespace and comments
-            if isinstance(value, str):
-                value = value.split('#')[0].strip()
-            return int(value)
-        elif var_type is float:
-            if isinstance(value, str):
-                value = value.split('#')[0].strip()
-            return float(value)
-        else:
-            return value
-    except (ValueError, TypeError) as e:
-        logger.error(f"Error converting {var_name}: {e}")
+        if default is None:
+            raise ValueError(f"Environment variable {var_name} is not set and no default provided")
         return default
-
-# Global variables for configuration
-INFLUXDB_URL = None
-INFLUXDB_TOKEN = None
-INFLUXDB_ORG = None
-INFLUXDB_BUCKET = None
-COM_PORT = None
-MEASUREMENT_INTERVAL = 60
-SENSOR_TYPE = "scd30"
-
-def load_configuration():
-    """Load configuration from environment variables"""
-    global INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET, COM_PORT, MEASUREMENT_INTERVAL, SENSOR_TYPE
     
+    if var_type == bool:
+        return value.lower() in ('true', 'yes', '1', 't', 'y')
+    
+    return var_type(value)
+
+def main():
+    """Main function to run the sensor data collector."""
     # Load environment variables - force reload
     load_dotenv(override=True)
     
@@ -81,7 +50,7 @@ def load_configuration():
     SENSOR_TYPE = get_env_var("SENSOR_TYPE", "scd30")  # Default to SCD30
 
 class FeatherS2SensorReader:
-    """Class to handle communication with the Feather S2 board and BME688 sensor."""
+    """Class to handle communication with the Feather S2 board and sensor."""
     
     def __init__(self, com_port, baud_rate=115200, sensor_type="scd30"):
         """Initialize the Feather S2 reader."""
@@ -99,22 +68,10 @@ class FeatherS2SensorReader:
             # Allow time for the serial connection to initialize
             time.sleep(2)
             
-            # Clear any initial data in the buffer
-            # self.serial_conn.reset_input_buffer()
-            
-            # # Exit the CircuitPython REPL if active by sending Ctrl+C
-            # self.serial_conn.write(b'\x03\x03')  # Send Ctrl+C twice
-            # time.sleep(0.5)
-            
-            # # Clear buffer again after Ctrl+C
-            # if self.serial_conn.in_waiting:
-            #     initial_data = self.serial_conn.read(self.serial_conn.in_waiting).decode('utf-8', errors='replace')
-            #     logger.info(f"Cleared initial data: '{initial_data}'")
-            
-            # # Send a newline to check if we get a response
-            # self.serial_conn.write(b'\n')
-            # time.sleep(0.5)
-            
+            # Clear any pending data in the buffer
+            if self.serial_conn.in_waiting:
+                self.serial_conn.reset_input_buffer()
+                
             return True
         except serial.SerialException as e:
             logger.error(f"Failed to connect to {self.com_port}: {e}")
@@ -147,7 +104,6 @@ class FeatherS2SensorReader:
                 return None
             
             # Read all available data
-            all_data = ""
             try:
                 all_data = self.serial_conn.read(self.serial_conn.in_waiting).decode('utf-8', errors='replace')
                 logger.info(f"Received data: '{all_data}'")
@@ -168,7 +124,6 @@ class FeatherS2SensorReader:
                 return None
                 
             # Look for JSON data in the response with JSON: prefix
-            import re
             # First try to match the JSON: prefix format
             json_match = re.search(r'JSON:(\{.*?\})', all_data, re.DOTALL)
             
@@ -376,20 +331,22 @@ class FeatherS2SensorReader:
                             # If no JSON with prefix found, try the original JSON pattern
                             json_match = re.search(r'\{.*?\}', response_data, re.DOTALL)
                             if json_match:
+                                json_str = json_match.group(0)
+                                logger.info(f"Found JSON string in REPL response: '{json_str}'")
+                                
                                 try:
-                                    json_str = json_match.group(0)
-                                    logger.info(f"Found JSON string: '{json_str}'")
+                                    # Parse JSON response
                                     sensor_data = json.loads(json_str)
-                                    logger.info(f"Parsed sensor data: {sensor_data}")
+                                    logger.info(f"Parsed sensor data from REPL: {sensor_data}")
                                     return sensor_data
                                 except json.JSONDecodeError as e:
-                                    logger.error(f"Failed to parse JSON: {e}")
-                            
-            else:
-                logger.warning("No data received from sensor. Check if the Feather S2 is responding.")
+                                    logger.error(f"Failed to parse JSON from REPL: {e}")
+                else:
+                    logger.warning("No data received from sensor. Check if the Feather S2 is responding.")
                 
                 # If we got here, we didn't get valid data
                 return None
+                
         except serial.SerialException as e:
             logger.error(f"Serial communication error: {e}")
             self.disconnect()
@@ -416,254 +373,183 @@ class InfluxDBWriter:
         self.write_api = None
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.is_cloud = 'cloud' in url.lower() or not url.startswith('http://localhost')
-        
-    def connect(self):
-        """Connect to InfluxDB with retry logic."""
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                # Initialize the InfluxDB client
-                logger.info(f"Connecting to InfluxDB at {self.url} (Attempt {attempt}/{self.max_retries})...")
-                self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
-                self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-                
-                # Verify connection by checking health
-                health = self.client.health()
-                logger.info(f"InfluxDB status: {health.status}, version: {health.version}")
-                
-                # Verify bucket exists
-                buckets_api = self.client.buckets_api()
-                buckets = buckets_api.find_buckets().buckets
-                bucket_exists = False
-                
-                for bucket in buckets:
-                    if bucket.name == self.bucket:
-                        bucket_exists = True
-                        logger.info(f"Bucket '{self.bucket}' exists")
-                        break
-                
-                if not bucket_exists:
-                    if self.is_cloud:
-                        logger.error(f"Bucket '{self.bucket}' not found in InfluxDB Cloud. Please create it in the InfluxDB Cloud UI.")
-                    else:
-                        logger.error(f"Bucket '{self.bucket}' not found. Please create it first.")
-                    return False
-                
-                logger.info(f"Successfully connected to InfluxDB at {self.url}")
-                return True
-                
-            except ApiException as e:
-                logger.error(f"InfluxDB API error (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    logger.error("Maximum retry attempts reached. Could not connect to InfluxDB.")
-                    return False
-                    
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"Connection error (attempt {attempt}/{self.max_retries}): {e}")
-                if self.is_cloud:
-                    logger.error("Could not connect to InfluxDB Cloud. Please check your internet connection.")
-                else:
-                    logger.error("Could not connect to local InfluxDB. Please check if the server is running.")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    logger.error("Maximum retry attempts reached. Could not connect to InfluxDB.")
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"Failed to connect to InfluxDB (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    logger.error("Maximum retry attempts reached. Could not connect to InfluxDB.")
-                    return False
     
+    def connect(self):
+        """Connect to InfluxDB."""
+        try:
+            logger.info(f"Connecting to InfluxDB at {self.url}")
+            self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
+            self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+            
+            # Verify connection by checking health
+            health = self.client.health()
+            logger.info(f"InfluxDB health check: {health.status}")
+            
+            # Check if we can write to the bucket
+            try:
+                # Create a test point
+                test_point = Point("connection_test").tag("test", "true").field("value", 1)
+                
+                # Write the test point
+                self.write_api.write(bucket=self.bucket, record=test_point)
+                logger.info(f"Successfully wrote test point to bucket '{self.bucket}'")
+                
+                return True
+            except Exception as e:
+                logger.error(f"Failed to write test point to bucket '{self.bucket}': {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to connect to InfluxDB: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from InfluxDB."""
+        if self.client:
+            self.client.close()
+            self.client = None
+            self.write_api = None
+            logger.info("Disconnected from InfluxDB")
+    
+    @backoff.on_exception(backoff.expo, 
+                         (requests.exceptions.ConnectionError, 
+                          requests.exceptions.Timeout), 
+                         max_tries=3)
     def write_data(self, data):
-        """Write sensor data to InfluxDB with retry logic."""
+        """Write sensor data to InfluxDB."""
         if not self.client or not self.write_api:
             logger.error("InfluxDB client is not initialized")
             return False
-        
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                # Create a data point based on sensor type
-                if data.get("temperature") and data.get("humidity") and data.get("pressure") and data.get("gas_resistance") and data.get("voc"):
-                    point = Point("bme688_sensor") \
-                        .tag("device", "feather_s2") \
-                        .field("temperature", data["temperature"]) \
-                        .field("humidity", data["humidity"]) \
-                        .field("pressure", data["pressure"]) \
-                        .field("gas_resistance", data["gas_resistance"]) \
-                        .field("voc", data["voc"]) \
-                        .time(datetime.utcnow())
-                elif data.get("co2") and data.get("temperature") and data.get("humidity"):
-                    point = Point("scd30_sensor") \
-                        .tag("device", "feather_s2") \
-                        .field("co2", data["co2"]) \
-                        .field("temperature", data["temperature"]) \
-                        .field("humidity", data["humidity"]) \
-                        .time(datetime.utcnow())
-                else:
-                    logger.error(f"Invalid data format: {data}")
-                    return False
-                
-                self.write_api.write(bucket=self.bucket, org=self.org, record=point)
-                logger.info(f"Data written to InfluxDB: {data}")
-                return True
-                
-            except ApiException as e:
-                logger.error(f"InfluxDB API error during write (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying write in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    logger.error("Maximum retry attempts reached. Could not write data.")
-                    return False
-                    
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"Connection error during write (attempt {attempt}/{self.max_retries}): {e}")
-                if self.is_cloud:
-                    logger.error("Could not connect to InfluxDB Cloud. Please check your internet connection.")
-                else:
-                    logger.error("Could not connect to local InfluxDB. Please check if the server is running.")
-                    
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying write in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    logger.error("Maximum retry attempts reached. Could not write data.")
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"Failed to write data (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying write in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    logger.error("Maximum retry attempts reached. Could not write data.")
-                    return False
-    
-    def close(self):
-        """Close the InfluxDB client."""
-        if self.client:
-            try:
-                self.client.close()
-                logger.info("InfluxDB client closed")
-            except Exception as e:
-                logger.error(f"Error closing InfluxDB client: {e}")
+
+        try:
+            # Create a data point based on sensor type
+            if data.get("temperature") and data.get("humidity") and data.get("pressure") and data.get("gas_resistance") and data.get("voc"):
+                point = Point("bme688_sensor") \
+                    .tag("device", "feather_s2") \
+                    .field("temperature", data["temperature"]) \
+                    .field("humidity", data["humidity"]) \
+                    .field("pressure", data["pressure"]) \
+                    .field("gas_resistance", data["gas_resistance"]) \
+                    .field("voc", data["voc"]) \
+                    .time(datetime.utcnow())
+            elif data.get("co2") and data.get("temperature") and data.get("humidity"):
+                point = Point("scd30_sensor") \
+                    .tag("device", "feather_s2") \
+                    .field("co2", data["co2"]) \
+                    .field("temperature", data["temperature"]) \
+                    .field("humidity", data["humidity"]) \
+                    .time(datetime.utcnow())
+            else:
+                logger.error(f"Unknown data format: {data}")
+                return False
+
+            self.write_api.write(bucket=self.bucket, org=self.org, record=point)
+            logger.info(f"Data written to InfluxDB: {data}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write data to InfluxDB: {e}")
+            return False
 
 def main():
-    """Main function to read sensor data and write to InfluxDB Cloud."""
-    # Load configuration from environment variables
-    load_configuration()
+    """Main function to run the sensor data collector."""
+    # Load environment variables - force reload
+    load_dotenv(override=True)
     
-    # Check if required environment variables are set
-    if not INFLUXDB_URL:
-        logger.error("InfluxDB URL is not set. Please set the INFLUXDB_URL environment variable.")
-        sys.exit(1)
-        
-    if not INFLUXDB_TOKEN:
-        logger.error("InfluxDB token is not set. Please set the INFLUXDB_TOKEN environment variable.")
-        sys.exit(1)
+    # Get InfluxDB configuration
+    INFLUXDB_URL = get_env_var("INFLUXDB_URL")
+    INFLUXDB_TOKEN = get_env_var("INFLUXDB_TOKEN")
+    INFLUXDB_ORG = get_env_var("INFLUXDB_ORG")
+    INFLUXDB_BUCKET = get_env_var("INFLUXDB_BUCKET")
+    COM_PORT = get_env_var("COM_PORT")
+    MEASUREMENT_INTERVAL = get_env_var("MEASUREMENT_INTERVAL", 60, int)
+    SENSOR_TYPE = get_env_var("SENSOR_TYPE", "scd30")  # Default to SCD30
+
+    # Initialize InfluxDB writer
+    influxdb_writer = InfluxDBWriter(INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET)
     
-    if not INFLUXDB_ORG:
-        logger.error("InfluxDB organization is not set. Please set the INFLUXDB_ORG environment variable.")
-        sys.exit(1)
-        
-    if not INFLUXDB_BUCKET:
-        logger.error("InfluxDB bucket is not set. Please set the INFLUXDB_BUCKET environment variable.")
-        sys.exit(1)
-        
-    if not COM_PORT:
-        logger.error("COM port is not set. Please set the COM_PORT environment variable.")
-        sys.exit(1)
-    
-    # Initialize sensor reader
+    # Initialize Feather S2 sensor reader
     sensor_reader = FeatherS2SensorReader(COM_PORT, sensor_type=SENSOR_TYPE)
-    if not sensor_reader.connect():
-        logger.error("Failed to connect to sensor. Exiting.")
-        sys.exit(1)
     
-    # Initialize InfluxDB writer with retry capabilities
-    is_cloud = 'cloud' in INFLUXDB_URL.lower() or not INFLUXDB_URL.startswith('http://localhost')
-    if is_cloud:
-        logger.info("Connecting to InfluxDB Cloud...")
-    else:
-        logger.info("Connecting to local InfluxDB instance...")
-        
-    influxdb_writer = InfluxDBWriter(INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET, max_retries=3, retry_delay=5)
+    # Connect to InfluxDB
     if not influxdb_writer.connect():
         logger.error("Failed to connect to InfluxDB. Exiting.")
-        sensor_reader.disconnect()
-        sys.exit(1)
+        return
     
-    logger.info(f"Starting data collection. Measurement interval: {MEASUREMENT_INTERVAL} seconds")
-    
-    # Track consecutive failures
-    consecutive_failures = 0
-    max_consecutive_failures = 5
-    
+    # Main loop
     try:
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+        serial_reconnect_count = 0
+        max_serial_reconnects = 3
+        
+        # Connect to the sensor initially
+        if not sensor_reader.connect():
+            logger.error("Failed to connect to the sensor initially. Retrying...")
+            time.sleep(5)
+            if not sensor_reader.connect():
+                logger.error("Failed to connect to the sensor again. Please check connections.")
+                return
+        
         while True:
-            try:
-                # Read sensor data
-                sensor_data = sensor_reader.read_sensor_data()
+            # Read sensor data
+            sensor_data = sensor_reader.read_sensor_data()
+            
+            if not sensor_data:
+                logger.warning("No sensor data received")
+                consecutive_failures += 1
+                logger.warning(f"Failed to get sensor data. Consecutive failures: {consecutive_failures}/{max_consecutive_failures}")
                 
-                if sensor_data:
-                    # Write data to InfluxDB
-                    success = influxdb_writer.write_data(sensor_data)
-                    if success:
-                        consecutive_failures = 0  # Reset failure counter on success
-                    else:
-                        consecutive_failures += 1
-                        logger.warning(f"Failed to write data. Consecutive failures: {consecutive_failures}/{max_consecutive_failures}")
-                else:
-                    logger.warning("No sensor data received")
-                    consecutive_failures += 1
-                    logger.warning(f"Failed to get sensor data. Consecutive failures: {consecutive_failures}/{max_consecutive_failures}")
-                
-                # If too many consecutive failures, attempt to reconnect
                 if consecutive_failures >= max_consecutive_failures:
-                    logger.warning("Too many consecutive failures. Attempting to reconnect...")
+                    logger.error("Too many consecutive failures. Reconnecting...")
                     
-                    # Try to reconnect to the sensor
+                    # Try to reconnect to the serial port
                     sensor_reader.disconnect()
                     time.sleep(2)
-                    if sensor_reader.connect():
-                        logger.info("Successfully reconnected to sensor")
-                    else:
-                        logger.error("Failed to reconnect to sensor")
                     
-                    # Try to reconnect to InfluxDB
-                    influxdb_writer.close()
-                    time.sleep(2)
-                    if influxdb_writer.connect():
-                        logger.info("Successfully reconnected to InfluxDB")
+                    if not sensor_reader.connect():
+                        serial_reconnect_count += 1
+                        logger.error(f"Failed to reconnect to serial port. Attempt {serial_reconnect_count}/{max_serial_reconnects}")
+                        
+                        if serial_reconnect_count >= max_serial_reconnects:
+                            logger.error("Maximum serial reconnection attempts reached. Reconnecting to InfluxDB and resetting counters...")
+                            influxdb_writer.disconnect()
+                            time.sleep(2)
+                            influxdb_writer.connect()
+                            serial_reconnect_count = 0
                     else:
-                        logger.error("Failed to reconnect to InfluxDB")
+                        logger.info("Successfully reconnected to serial port")
+                        serial_reconnect_count = 0
                     
-                    consecutive_failures = 0  # Reset counter after reconnection attempt
+                    consecutive_failures = 0
+            else:
+                # Reset consecutive failures counter
+                consecutive_failures = 0
+                serial_reconnect_count = 0
                 
-                # Wait for the next measurement
+                # Write data to InfluxDB
+                if not influxdb_writer.write_data(sensor_data):
+                    logger.error("Failed to write data to InfluxDB")
+                    # Try to reconnect to InfluxDB
+                    influxdb_writer.disconnect()
+                    time.sleep(2)
+                    influxdb_writer.connect()
+            
+            # Wait for the next measurement (with shorter interval if there was an error)
+            if consecutive_failures > 0:
+                # Use a shorter interval when having problems to recover faster
+                time.sleep(min(MEASUREMENT_INTERVAL, 10))
+            else:
                 time.sleep(MEASUREMENT_INTERVAL)
                 
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                consecutive_failures += 1
-                logger.warning(f"Error in main loop. Consecutive failures: {consecutive_failures}/{max_consecutive_failures}")
-                time.sleep(MEASUREMENT_INTERVAL)  # Still wait before next attempt
-                
     except KeyboardInterrupt:
-        logger.info("Data collection stopped by user")
+        logger.info("Keyboard interrupt received. Exiting...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
         # Clean up
         sensor_reader.disconnect()
-        influxdb_writer.close()
+        influxdb_writer.disconnect()
+        logger.info("Sensor data collector stopped")
 
 if __name__ == "__main__":
     main()
